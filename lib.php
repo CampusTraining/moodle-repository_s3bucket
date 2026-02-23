@@ -171,7 +171,7 @@ class repository_s3bucket extends repository {
      */
     public function send_file($storedfile, $lifetime = null, $filter = 0, $forcedownload = true, array $options = null) {
         $duration = get_config('s3bucket', 'duration');
-        $this->send_otherfile($storedfile->get_reference(), "+$duration minutes");
+        $this->send_otherfile($storedfile->get_reference(), "+$duration minutes", $forcedownload);
     }
 
     /**
@@ -179,14 +179,20 @@ class repository_s3bucket extends repository {
      *
      * @param string $reference the filereference
      * @param string $lifetime Number of seconds before the file should expire from caches
+     * @param bool $forcedownload If true, forces download (attachment); if false, open in browser (inline)
      */
-    public function send_otherfile($reference, $lifetime) {
+    public function send_otherfile($reference, $lifetime, $forcedownload = true) {
         if ($reference != '') {
+            $filename = basename($reference);
+            $disposition = $forcedownload ? 'attachment' : 'inline';
+            $contentdisposition = $disposition . '; filename="' . $filename . '"';
+
             $s3 = $this->create_s3();
             $options = [
                'Bucket' => $this->get_option('bucket_name'),
                'Key' => $reference,
-               'ResponseContentDisposition' => 'attachment', ];
+               'ResponseContentDisposition' => $contentdisposition,
+            ];
             try {
                 $result = $s3->getCommand('GetObject', $options);
                 $req = $s3->createPresignedRequest($result, $lifetime);
@@ -198,7 +204,7 @@ class repository_s3bucket extends repository {
             header('Cache-Control: private, must-revalidate, pre-check=0, post-check=0, max-age=0');
             header('Pragma: no-cache');
             header("Content-Type: $mimetype\n");
-            header("Content-Disposition: attachment; filename=\"$reference\"");
+            header('Content-Disposition: ' . $contentdisposition);
             header("Location: $uri");
             die;
         }
@@ -470,7 +476,7 @@ function repository_s3bucket_pluginfile($course, $cm, $context, $filearea, $args
         $itemid = array_shift($args);
         $reference = implode('/', $args);
         $repo = repository::get_repository_by_id($itemid, $context);
-        $repo->send_otherfile($reference, "+$duration minutes");
+        $repo->send_otherfile($reference, "+$duration minutes", $forcedownload);
     }
     return false;
 }
