@@ -40,6 +40,9 @@ class repository_s3bucket extends repository {
     /** @var _s3client s3 client object */
     private $_s3client;
 
+    /** @var array In-memory cache for stable->versioned key resolution (scorm/stable/ only) */
+    private static $latestkeycache = [];
+
     /**
      * Get S3 file list
      *
@@ -161,6 +164,79 @@ class repository_s3bucket extends repository {
     }
 
     /**
+     * Check if reference uses the scorm/stable/ latest convention.
+     * Only scorm/stable/<name>.zip is resolved; other paths are served as-is.
+     *
+     * @param string $reference S3 key (e.g. scorm/stable/encuestascorm.zip)
+     * @return bool
+     */
+    protected static function should_use_latest_folder($reference) {
+        if (!is_string($reference) || $reference === '') {
+            return false;
+        }
+        return substr($reference, 0, 14) === 'scorm/stable/'
+            && substr($reference, -4) === '.zip'
+            && substr_count($reference, '..') === 0;
+    }
+
+    /**
+     * Validate that a resolved key from JSON is safe and within allowed paths.
+     *
+     * @param mixed $key Value from JSON "key" field
+     * @return bool
+     */
+    protected static function is_valid_resolved_key($key) {
+        if (!is_string($key) || trim($key) === '') {
+            return false;
+        }
+        $key = trim($key);
+        // Must be under scorm/versions/, end with .zip, no path traversal.
+        return substr($key, 0, 16) === 'scorm/versions/'
+            && substr($key, -4) === '.zip'
+            && strpos($key, '..') === false
+            && preg_match('#^scorm/versions/[a-zA-Z0-9_\-\.]+__[a-zA-Z0-9_\-\.]+\.zip$#', $key);
+    }
+
+    /**
+     * Resolve scorm/stable/<name>.zip to scorm/versions/<name>__<timestamp>.zip
+     * by reading scorm/stable/<name>_latest.json.
+     * Uses in-memory cache (per request) to avoid repeated S3 reads.
+     *
+     * @param string $reference Stable key (scorm/stable/<name>.zip)
+     * @return string|null Real key, or null on failure (fallback to $reference)
+     */
+    protected function resolve_latest_key($reference) {
+        if (isset(self::$latestkeycache[$reference])) {
+            return self::$latestkeycache[$reference];
+        }
+        $realkey = null;
+        $jsonkey = preg_replace('#\.zip$#', '_latest.json', $reference);
+        $s3 = $this->create_s3();
+        $bucket = $this->get_option('bucket_name');
+        try {
+            $result = $s3->getObject([
+                'Bucket' => $bucket,
+                'Key' => $jsonkey,
+            ]);
+            $body = (string) $result['Body'];
+            $data = json_decode($body, true);
+            if (is_array($data) && isset($data['key']) && self::is_valid_resolved_key($data['key'])) {
+                $realkey = trim($data['key']);
+            }
+        } catch (Exception $e) {
+            // Fallback to original reference.
+        }
+        self::$latestkeycache[$reference] = $realkey;
+        if ($realkey !== null) {
+            global $CFG;
+            if (!empty($CFG->debugdeveloper)) {
+                debugging("repository_s3bucket: resolved stable '$reference' -> '$realkey'", DEBUG_DEVELOPER);
+            }
+        }
+        return $realkey;
+    }
+
+    /**
      * Repository method to serve the referenced file
      *
      * @param stored_file $storedfile the file that contains the reference
@@ -187,10 +263,19 @@ class repository_s3bucket extends repository {
             $disposition = $forcedownload ? 'attachment' : 'inline';
             $contentdisposition = $disposition . '; filename="' . $filename . '"';
 
+            // Resolve scorm/stable/<name>.zip -> scorm/versions/<name>__<ts>.zip via _latest.json.
+            $realkey = $reference;
+            if (self::should_use_latest_folder($reference)) {
+                $resolved = $this->resolve_latest_key($reference);
+                if ($resolved !== null) {
+                    $realkey = $resolved;
+                }
+            }
+
             $s3 = $this->create_s3();
             $options = [
                'Bucket' => $this->get_option('bucket_name'),
-               'Key' => $reference,
+               'Key' => $realkey,
                'ResponseContentDisposition' => $contentdisposition,
             ];
             try {
